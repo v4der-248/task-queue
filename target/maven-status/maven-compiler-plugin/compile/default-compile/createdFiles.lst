@@ -1,1 +1,9 @@
+com\param\task_queue\dto\CreateJobResponseDTO.class
+com\param\task_queue\entities\JobStatus.class
+com\param\task_queue\services\JobService.class
+com\param\task_queue\dto\CreateJobRequestDTO.class
 com\param\task_queue\TaskQueueApplication.class
+com\param\task_queue\controllers\JobController.class
+com\param\task_queue\entities\JobType.class
+com\param\task_queue\dto\CreateJobResponseDTO$CreateJobResponseDTOBuilder.class
+com\param\task_queue\repositories\JobRepository.class
