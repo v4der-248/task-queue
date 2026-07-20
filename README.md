@@ -1,190 +1,17 @@
 # Task Queue
 
-A lightweight, database-backed job queue service built with Spring Boot and PostgreSQL. Designed as a simple, self-hosted alternative for scheduling and tracking async background jobs — no external message brokers required.
+A lightweight, database-backed job queue service built with Spring Boot and PostgreSQL. Producers POST a job over HTTP, the queue persists it, and a worker (not yet implemented) is intended to poll and process it when due. No message broker — PostgreSQL is the only infrastructure dependency.
 
----
+## Prerequisites
 
-## Problem It Solves
+- Java 17
+- Maven (or use the bundled `mvnw` / `mvnw.cmd` wrapper — no local Maven install required)
+- A running PostgreSQL instance
 
-Applications often need to run background work asynchronously — send an email, generate a report, process an image. This project provides a simple HTTP-based job queue: a producer POSTs a job, the queue persists it, and a worker polls and processes it when it's due. No Kafka, no RabbitMQ — just a database and a polling loop.
+## Setup
 
----
+**1. Start PostgreSQL.** Any local install or container works, as long as it's reachable at the host/port/db name used in step 2. Example with Docker:
 
-## Tech Stack
-
-| Technology       | Version | Role                                  |
-|------------------|---------|---------------------------------------|
-| Java             | 17      | Language                              |
-| Spring Boot      | 4.0.6   | Framework                             |
-| Spring Data JPA  | —       | ORM / repository layer                |
-| Spring Web MVC   | —       | REST API                              |
-| PostgreSQL       | —       | Persistence                           |
-| Lombok           | —       | Boilerplate reduction (`@Data`, `@Builder`) |
-| Maven            | 3.x     | Build tool                            |
-
----
-
-## Architecture
-
-```
-HTTP Client
-     │
-     ▼
-┌─────────────────┐
-│  JobController  │   REST layer — /jobs/**
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│   JobService    │   Business logic — creation, status transitions, retries
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  JobRepository  │   JPA repository — JpaRepository<Job, UUID>
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│   PostgreSQL    │   jobs table
-└─────────────────┘
-```
-
-Standard 3-layer Spring Boot architecture. No cross-layer coupling — controllers never touch repositories directly.
-
----
-
-## Domain Model
-
-### `Job` Entity
-
-The `Job` is the core entity. Every background task is a row in the `jobs` table.
-
-| Field                   | Type               | Description |
-|-------------------------|--------------------|-------------|
-| `id`                    | `UUID`             | Primary key. UUID avoids sequential ID guessing and allows future client-side ID generation. |
-| `jobType`               | `JobType` (enum)   | Discriminates what a worker should do. Stored as `STRING` in DB for readability. |
-| `consumerUri`           | `String`           | The URI the worker calls when processing this job (webhook/callback model). |
-| `payload`               | `String`           | Arbitrary data (typically JSON) the consumer needs. Raw `String` to decouple queue schema from job-specific payloads. |
-| `jobStatus`             | `JobStatus` (enum) | Current position in the lifecycle state machine. |
-| `retryCount`            | `Integer`          | How many times this job has been attempted. Worker uses this to enforce retry limits. |
-| `eligibleToPickAfter`   | `Instant`          | Earliest time a worker may pick up this job. Dual-purpose: initial delay scheduling + retry backoff. |
-| `createdAt`             | `Instant`          | Audit — when the job was enqueued. |
-| `updatedAt`             | `Instant`          | Audit — last state change. |
-
-> **Known issue:** The field is declared as `Id` (capital I) in `Job.java`. This is a Java naming convention violation and may cause unexpected JPA column mapping. Should be renamed to `id`.
-
-### Job Lifecycle (State Machine)
-
-```
-                   ┌──────────┐
-   createJob() →   │ PENDING  │   Enqueued, waiting to be picked up
-                   └────┬─────┘
-                        │  worker polls: eligibleToPickAfter <= now()
-                        ▼
-                   ┌──────────┐
-                   │ RUNNING  │   Worker is actively processing
-                   └────┬─────┘
-               ┌────────┴─────────┐
-               │                  │
-               ▼                  ▼
-         ┌──────────┐       ┌──────────┐
-         │COMPLETED │       │  FAILED  │   retryCount < maxRetries
-         └──────────┘       └────┬─────┘
-                                 │  retryCount++, eligibleToPickAfter += backoff
-                                 │  → status reset to PENDING (re-queued)
-                                 │
-                                 │  retryCount >= maxRetries
-                                 ▼
-                            ┌──────────┐
-                            │   DEAD   │   Terminal. No more retries. Stays in DB for audit.
-                            └──────────┘
-```
-
-- `FAILED` jobs are re-queued automatically: `retryCount` increments, `eligibleToPickAfter` pushed forward (exponential backoff), status flips back to `PENDING`.
-- `DEAD` jobs are never retried. They remain in the table for manual inspection and debugging.
-
-### `JobType` Enum
-
-Tells the worker which handler to invoke. All values stored as strings in the DB.
-
-| Value              | Intent                                          |
-|--------------------|-------------------------------------------------|
-| `SEND_EMAIL`       | Trigger an outbound email via `consumerUri`     |
-| `GENERATE_REPORT`  | Kick off a report generation pipeline           |
-| `PROCESS_IMAGE`    | Image transformation / processing               |
-| `TRIGGER_WEBHOOK`  | Fire a generic outbound webhook                 |
-| `DATA_CLEANUP`     | Scheduled maintenance / housekeeping tasks      |
-
-### `JobStatus` Enum
-
-| Value       | Meaning                                                           |
-|-------------|-------------------------------------------------------------------|
-| `PENDING`   | Waiting to be picked up (or re-queued after a failed attempt)     |
-| `RUNNING`   | Actively being processed by a worker                              |
-| `COMPLETED` | Successfully processed                                            |
-| `FAILED`    | Processing failed, eligible for retry                             |
-| `DEAD`      | Exhausted all retries — terminal state                            |
-
----
-
-## API
-
-**Base path:** `/jobs`
-
-| Method | Path    | Status     | Description          |
-|--------|---------|------------|----------------------|
-| POST   | `/jobs` | Planned    | Enqueue a new job    |
-
-> `JobController` exists but has no endpoint methods yet. The class is wired with constructor injection of `JobService`.
-
-### Planned — Create Job
-
-```http
-POST /jobs
-Content-Type: application/json
-
-{
-  "jobType": "SEND_EMAIL",
-  "consumerUri": "https://example.com/webhooks/email",
-  "payload": "{\"to\": \"user@example.com\", \"subject\": \"Hello\"}"
-}
-```
-
-Expected response: the created `Job` object — `id` (UUID), `jobStatus: PENDING`, `retryCount: 0`, `eligibleToPickAfter: now`, `createdAt`.
-
----
-
-## Database
-
-**Table:** `jobs` — auto-created by Hibernate from the `Job` entity.
-
-No Flyway/Liquibase yet. Schema is currently managed by `spring.jpa.hibernate.ddl-auto`.
-
-**Approximate DDL:**
-```sql
-CREATE TABLE jobs (
-    id                      UUID PRIMARY KEY,
-    job_type                VARCHAR(50)              NOT NULL,
-    consumer_uri            VARCHAR(255),
-    payload                 TEXT,
-    job_status              VARCHAR(20)              NOT NULL,
-    retry_count             INTEGER,
-    eligible_to_pick_after  TIMESTAMP WITH TIME ZONE,
-    created_at              TIMESTAMP WITH TIME ZONE,
-    updated_at              TIMESTAMP WITH TIME ZONE
-);
-```
-
-> **Performance note:** When the worker is implemented, add a composite index on `(job_status, eligible_to_pick_after)` — that's the exact predicate the polling query will use (`WHERE job_status = 'PENDING' AND eligible_to_pick_after <= now()`).
-
----
-
-## Running Locally
-
-**Prerequisites:** Java 17, Maven, PostgreSQL (local or Docker).
-
-**1. Start PostgreSQL:**
 ```bash
 docker run -d \
   -p 5432:5432 \
@@ -194,51 +21,56 @@ docker run -d \
   postgres:15
 ```
 
-**2. Add DB config to `src/main/resources/application.properties`:**
+**2. Datasource configuration.** `src/main/resources/application.properties` currently contains:
+
 ```properties
+spring.application.name=task-queue
+
 spring.datasource.url=jdbc:postgresql://localhost:5432/taskqueue
 spring.datasource.username=postgres
-spring.datasource.password=postgres
+spring.datasource.password=shree420
 spring.jpa.hibernate.ddl-auto=update
 spring.jpa.show-sql=true
 ```
 
-**3. Run:**
+`ddl-auto=update` means Hibernate creates/updates the `jobs` table automatically from the `Job` entity — there are no Flyway/Liquibase migrations in this project. Adjust the URL/username/password to match your local PostgreSQL instance if it differs from the defaults above.
+
+> Note: the datasource password is currently committed in plaintext in `application.properties`. Treat this as a local-dev-only value and be careful not to reuse it, or any real credential, in a file that gets committed.
+
+**3. Build:**
+
+```bash
+./mvnw compile
+```
+
+On Windows, use `mvnw.cmd` instead of `./mvnw`.
+
+**4. Run tests:**
+
+```bash
+./mvnw test
+```
+
+To run a single test:
+
+```bash
+./mvnw test -Dtest=TaskQueueApplicationTests#contextLoads
+```
+
+**5. Run the app:**
+
 ```bash
 ./mvnw spring-boot:run
 ```
 
----
+## Current status / limitations
 
-## Design Decisions
+- **Package name:** the base package is `com.param.task_queue` (underscore). The original `com.param.task-queue` is invalid Java — see `HELP.md`.
+- **One functional endpoint:** `POST /jobs/create` creates a job in `PENDING` status. See `API_SPEC.md` for the exact request/response contract. There are no other endpoints (no list, get-by-id, cancel, or status-update routes).
+- **No request validation:** `CreateJobRequestDTO` has no `@Valid`/Bean Validation constraints, and the project has no `spring-boot-starter-validation` dependency. A request with a missing `consumerUri` or `payload` will be accepted as-is (null values pass through to persistence).
+- **No worker / polling loop implemented.** Jobs are created and persisted as `PENDING` but nothing currently picks them up, runs them, or transitions them to `RUNNING`, `COMPLETED`, `FAILED`, or `DEAD`. `JobService.createJob()` is the only lifecycle transition implemented so far.
+- **No retry/backoff/dead-lettering logic.** `retryCount` and `eligibleToPickAfter` exist on the `Job` entity and are initialized on creation, but nothing currently reads or increments them.
+- **No API documentation dependency.** The project has no springdoc-openapi (or other OpenAPI) dependency, so `API_SPEC.md` is the hand-maintained source of truth for the REST contract until one is added.
+- **Schema managed by Hibernate auto-DDL**, not migrations. See `ARCHITECTURE.md` for the current table shape and indexing considerations for the not-yet-implemented polling worker.
 
-**Why UUID as primary key?**
-Avoids sequential IDs being guessable via HTTP. Also allows client-side ID generation — a producer can assign an ID before calling the API, enabling idempotent job creation.
-
-**Why store `consumerUri` on the job itself?**
-Keeps jobs self-contained. The worker needs no external routing config — the destination is encoded in the job row. This makes the queue generic and reusable across different services without any worker-side configuration.
-
-**Why `eligibleToPickAfter` instead of a plain `scheduledAt`?**
-Dual-purpose design: initial scheduling (delay a job's start) and retry backoff (bump the timestamp forward after a failure). One field covers both use cases cleanly.
-
-**Why raw `String` for `payload`?**
-Avoids coupling the queue schema to the structure of individual job types. Each `JobType` owns its own payload contract; the queue just stores and forwards the bytes. The consumer (webhook receiver) is responsible for parsing.
-
-**Why no message broker (Kafka, RabbitMQ)?**
-Intentional simplicity. Database-backed queues trade raw throughput for operational simplicity: no extra infrastructure, transactional consistency with the application DB, and queue state is fully inspectable via plain SQL. Suitable until throughput demands justify the complexity of a broker.
-
----
-
-## Current State & TODO
-
-- [x] `Job` entity with `JobStatus` and `JobType` enums
-- [x] `JobRepository` — JPA CRUD via `JpaRepository<Job, UUID>`
-- [x] `JobService.createJob()` — enqueues a `PENDING` job
-- [ ] Fix `Job.java` — rename field `Id` → `id` (JPA naming convention bug)
-- [ ] `JobController` — implement REST endpoints (at minimum: `POST /jobs`)
-- [ ] Auto-populate `createdAt` / `updatedAt` — use `@PrePersist` / `@PreUpdate` or `@EntityListeners(AuditingEntityListener.class)`
-- [ ] Worker / polling loop — query `WHERE job_status = 'PENDING' AND eligible_to_pick_after <= now()`, lock row, call `consumerUri`
-- [ ] Retry logic — on worker failure: `retryCount++`, `eligibleToPickAfter = now + backoff`, status → `PENDING`; if `retryCount >= max` → `DEAD`
-- [ ] Flyway migrations (replace `ddl-auto=update` with versioned SQL scripts)
-- [ ] Composite index on `(job_status, eligible_to_pick_after)` for polling query performance
-- [ ] DTOs for API request/response (decouple entity from wire format)
+See `ARCHITECTURE.md` for the layered design and domain model, and `API_SPEC.md` for the REST contract.

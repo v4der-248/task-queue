@@ -15,13 +15,21 @@ import com.param.task_queue.services.JobService;
 @RestController
 @RequestMapping("/jobs")
 public class JobController {
-    
+
     private final JobService jobService;
 
     public JobController(JobService jobService){
         this.jobService = jobService;
     }
 
+    /**
+     * Enqueues a new job in {@code PENDING} status and returns its generated id.
+     *
+     * @implNote No request validation is performed beyond default JSON
+     *     deserialization (e.g. a missing {@code consumerUri} or {@code payload}
+     *     is accepted and persisted as null) — see API_SPEC.md for the current
+     *     contract and its gaps.
+     */
     @PostMapping("/create")
     public ResponseEntity<CreateJobResponseDTO> createJob(@RequestBody CreateJobRequestDTO createJobRequestDTO){
         Job job = jobService.createJob(createJobRequestDTO.getJobType(), createJobRequestDTO.getConsumerUri(), createJobRequestDTO.getPayload());
